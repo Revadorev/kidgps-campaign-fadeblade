@@ -1,0 +1,24 @@
+name: Campanie FadeBlade kidgps
+
+on:
+  schedule:
+    # Postari la 09:00 si 18:00 RO = 06:00 si 15:00 UTC, 6-12 iulie 2026.
+    # Ruleaza des in ferestrele orare; logica "due & nepublicat" + anti-dublare.
+    - cron: '*/20 6-8 6-12 7 *'
+    - cron: '*/20 15-17 6-12 7 *'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Publish due posts
+        env:
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          REPO_RAW: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}
+        run: node publish.js
