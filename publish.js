@@ -12,7 +12,7 @@ const REPO_RAW = process.env.REPO_RAW;
 
 if (!PAGE_TOKEN || !IG_TOKEN || !REPO_RAW) { console.error('Lipsesc secrete/env'); process.exit(1); }
 
-function req(method, url, body) {
+function reqOnce(method, url, body) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const data = body ? new URLSearchParams(body).toString() : null;
@@ -23,9 +23,28 @@ function req(method, url, body) {
   });
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const isTransient = e => /ECONNRESET|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|socket hang up|network|timeout/i.test(e && e.message || '');
 
-// Upload fisier local la tmpfiles -> URL public direct
-function uploadTmp(filePath) {
+// Retry pe erori de retea tranzitorii (ECONNRESET etc.) — nu lasa un blip sa pice tot jobul.
+async function req(method, url, body) {
+  let last;
+  for (let i=0;i<4;i++){
+    try { return await reqOnce(method, url, body); }
+    catch(e){ last=e; if(!isTransient(e)) throw e; console.warn(`  ⟳ retry ${i+1}/4 (${e.message})`); await sleep(2000*(i+1)); }
+  }
+  throw last;
+}
+
+// Upload fisier local la tmpfiles -> URL public direct (cu retry, tmpfiles e instabil)
+async function uploadTmp(filePath) {
+  let last;
+  for (let i=0;i<4;i++){
+    try { return await uploadTmpOnce(filePath); }
+    catch(e){ last=e; console.warn(`  ⟳ tmpfiles retry ${i+1}/4 (${e.message})`); await sleep(3000*(i+1)); }
+  }
+  throw last;
+}
+function uploadTmpOnce(filePath) {
   return new Promise((resolve, reject) => {
     const boundary = '----up' + Date.now();
     const fileData = fs.readFileSync(filePath);
@@ -41,7 +60,7 @@ function uploadTmp(filePath) {
 
 async function waitContainer(id, token) {
   for (let i=0;i<40;i++){
-    const s = await req('GET', `https://graph.facebook.com/v22.0/${id}?fields=status_code&access_token=${token}`);
+    const s = await req('GET', `https://graph.facebook.com/v22.0/${id}?fields=status_code,status&access_token=${token}`);
     if (s.status_code==='FINISHED') return true;
     if (s.status_code==='ERROR') { console.error('  container ERROR', JSON.stringify(s)); return false; }
     await sleep(5000);
@@ -97,15 +116,20 @@ async function postIGCarousel(post) {
 // ── Instagram reel ──
 async function postIGReel(post) {
   if (await igPosted(post.ig_reel.caption, 'REELS')) { console.log('  ⏭️ IG reel deja postat'); return; }
-  let videoUrl;
-  try { videoUrl = await uploadTmp(post.ig_reel.video); }
-  catch(e){ console.error('  ❌ upload reel', e.message); return; }
-  const c = await req('POST', `https://graph.facebook.com/v22.0/${IG_ID}/media`, {
-    media_type:'REELS', video_url: videoUrl, caption: post.ig_reel.caption, share_to_feed:'true', access_token: IG_TOKEN });
-  if (!c.id) { console.error('  ❌ IG reel container', JSON.stringify(c)); return; }
-  if (!(await waitContainer(c.id, IG_TOKEN))) return;
-  const pub = await req('POST', `https://graph.facebook.com/v22.0/${IG_ID}/media_publish`, { creation_id: c.id, access_token: IG_TOKEN });
-  if (pub.id) console.log(`  ✅ IG reel postat (${pub.id})`); else console.error('  ❌ IG reel publish', JSON.stringify(pub));
+  // Reincearca tot ciclul upload->container: tmpfiles/ingestia IG pot esua tranzitoriu (container ERROR).
+  for (let attempt=1; attempt<=3; attempt++){
+    let videoUrl;
+    try { videoUrl = await uploadTmp(post.ig_reel.video); }
+    catch(e){ console.error(`  ❌ upload reel (incercarea ${attempt})`, e.message); await sleep(3000); continue; }
+    const c = await req('POST', `https://graph.facebook.com/v22.0/${IG_ID}/media`, {
+      media_type:'REELS', video_url: videoUrl, caption: post.ig_reel.caption, share_to_feed:'true', access_token: IG_TOKEN });
+    if (!c.id) { console.error(`  ❌ IG reel container (incercarea ${attempt})`, JSON.stringify(c)); await sleep(3000); continue; }
+    if (!(await waitContainer(c.id, IG_TOKEN))) { console.warn(`  ⟳ reel container ERROR, reincerc (${attempt}/3)`); await sleep(3000); continue; }
+    const pub = await req('POST', `https://graph.facebook.com/v22.0/${IG_ID}/media_publish`, { creation_id: c.id, access_token: IG_TOKEN });
+    if (pub.id) { console.log(`  ✅ IG reel postat (${pub.id})`); return; }
+    console.error(`  ❌ IG reel publish (incercarea ${attempt})`, JSON.stringify(pub)); await sleep(3000);
+  }
+  console.error('  ❌ IG reel esuat dupa 3 incercari');
 }
 
 async function main() {
@@ -115,15 +139,22 @@ async function main() {
   if (!due.length) { console.log(`Nicio postare due (${new Date(now*1000).toISOString()}).`); return; }
 
   console.log(`${due.length} postare(i) due:`);
+  let failures = 0;
+  const guard = async (label, fn) => {
+    try { await fn(); }
+    catch(e){ failures++; console.error(`  ❌ ${label} exceptie:`, e.message); }
+  };
   for (const post of due) {
     console.log(`\n▶ ${post.id} (${post.publish_ro})`);
-    await postFB(post);
+    await guard('FB', () => postFB(post));
     await sleep(2000);
-    await postIGCarousel(post);
+    await guard('IG carusel', () => postIGCarousel(post));
     await sleep(2000);
-    await postIGReel(post);
+    await guard('IG reel', () => postIGReel(post));
     await sleep(2000);
   }
-  console.log('\nGata.');
+  // Nu picam jobul pentru erori de continut individuale (evitam email-uri "All jobs failed"
+  // cand cea mai mare parte e deja postata). Doar raportam.
+  console.log(`\nGata. ${failures} actiune(i) esuata(e) — vor fi reincercate la urmatoarea rulare.`);
 }
 main().catch(e => { console.error('FATAL:', e.message); process.exit(1); });
