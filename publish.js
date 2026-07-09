@@ -116,11 +116,10 @@ async function postIGCarousel(post) {
 // ── Instagram reel ──
 async function postIGReel(post) {
   if (await igPosted(post.ig_reel.caption, 'REELS')) { console.log('  ⏭️ IG reel deja postat'); return; }
-  // Reincearca tot ciclul upload->container: tmpfiles/ingestia IG pot esua tranzitoriu (container ERROR).
+  // Video servit direct de pe raw.githubusercontent (deja in repo). tmpfiles.org a inceput
+  // sa dea eroare 2207082 (Meta nu mai poate descarca de acolo), asa ca nu-l mai folosim.
+  const videoUrl = `${REPO_RAW}/${post.ig_reel.video}`;
   for (let attempt=1; attempt<=3; attempt++){
-    let videoUrl;
-    try { videoUrl = await uploadTmp(post.ig_reel.video); }
-    catch(e){ console.error(`  ❌ upload reel (incercarea ${attempt})`, e.message); await sleep(3000); continue; }
     const c = await req('POST', `https://graph.facebook.com/v22.0/${IG_ID}/media`, {
       media_type:'REELS', video_url: videoUrl, caption: post.ig_reel.caption, share_to_feed:'true', access_token: IG_TOKEN });
     if (!c.id) { console.error(`  ❌ IG reel container (incercarea ${attempt})`, JSON.stringify(c)); await sleep(3000); continue; }
